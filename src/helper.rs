@@ -1,4 +1,5 @@
 use std::borrow::Cow::{self, Owned};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -22,6 +23,8 @@ const RESET: &str = "\x1b[0m";
 
 #[derive(Helper, Hinter, Validator)]
 pub struct ShellHelper {
+    // Copy of the shell aliases, refreshed before every prompt
+    pub aliases: BTreeMap<String, String>,
     filenames: FilenameCompleter,
     #[rustyline(Hinter)]
     hinter: HistoryHinter,
@@ -30,13 +33,14 @@ pub struct ShellHelper {
 impl ShellHelper {
     pub fn new() -> Self {
         Self {
+            aliases: BTreeMap::new(),
             filenames: FilenameCompleter::new(),
             hinter: HistoryHinter::new(),
         }
     }
 
     fn is_command(&self, name: &str) -> bool {
-        if BUILTINS.contains(&name) {
+        if BUILTINS.contains(&name) || self.aliases.contains_key(name) {
             return true;
         }
         if name.contains('/') {
@@ -49,6 +53,7 @@ impl ShellHelper {
         let mut names: Vec<String> = BUILTINS
             .iter()
             .map(|name| name.to_string())
+            .chain(self.aliases.keys().cloned())
             .filter(|name| name.starts_with(prefix))
             .collect();
         let paths = env::var_os("PATH").unwrap_or_default();
@@ -93,11 +98,14 @@ impl Completer for ShellHelper {
         pos: usize,
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        let start = line[..pos].rfind([' ', '\t']).map_or(0, |i| i + 1);
+        let start = line[..pos]
+            .rfind([' ', '\t', '|', '&', ';'])
+            .map_or(0, |i| i + 1);
         let word = &line[start..pos];
+        let before = line[..start].trim_end();
+        let is_command = before.is_empty() || before.ends_with(['|', '&', ';']);
 
-        // Only the first word is a command
-        if line[..start].trim().is_empty() && !word.contains('/') {
+        if is_command && !word.contains('/') {
             let pairs = self
                 .command_names(word)
                 .into_iter()
@@ -125,8 +133,8 @@ impl Highlighter for ShellHelper {
                 continue;
             }
             let (len, color) =
-                if let Some((op, _)) = OPERATORS.iter().find(|(op, _)| rest.starts_with(op)) {
-                    command_start = false;
+                if let Some((op, token)) = OPERATORS.iter().find(|(op, _)| rest.starts_with(op)) {
+                    command_start = token.is_separator();
                     (op.len(), CYAN)
                 } else {
                     match word_len(rest) {

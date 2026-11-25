@@ -62,6 +62,9 @@ fn interactive(shell: &mut Shell) -> rustyline::Result<()> {
     let _ = rl.load_history(&history);
 
     while shell.exit.is_none() {
+        if let Some(helper) = rl.helper_mut() {
+            helper.aliases.clone_from(&shell.aliases);
+        }
         let prompt = prompt();
         let colored = format!("\x1b[1;34m{prompt}\x1b[0m");
         match rl.readline(&(prompt, colored)) {

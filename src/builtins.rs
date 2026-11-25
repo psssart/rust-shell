@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::shell::Shell;
 
-pub const BUILTINS: [&str; 3] = ["cd", "exit", "ls"];
+pub const BUILTINS: [&str; 5] = ["alias", "cd", "exit", "ls", "pwd"];
 
 // io::Error without the " (os error N)" suffix
 pub fn error_text(e: &io::Error) -> String {
@@ -23,9 +23,11 @@ pub fn run(
     err: &mut dyn Write,
 ) -> io::Result<i32> {
     match args[0].as_str() {
+        "alias" => alias(shell, &args[1..], out, err),
         "cd" => cd(&args[1..], out, err),
         "exit" => exit(shell, &args[1..], err),
         "ls" => ls(&args[1..], out, err),
+        "pwd" => pwd(out),
         _ => unreachable!("not a builtin"),
     }
 }
@@ -60,6 +62,11 @@ fn cd(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> io::Result<i
     Ok(0)
 }
 
+fn pwd(out: &mut dyn Write) -> io::Result<i32> {
+    writeln!(out, "{}", env::current_dir()?.display())?;
+    Ok(0)
+}
+
 fn exit(shell: &mut Shell, args: &[String], err: &mut dyn Write) -> io::Result<i32> {
     let code = match args.first() {
         None => shell.status,
@@ -73,6 +80,41 @@ fn exit(shell: &mut Shell, args: &[String], err: &mut dyn Write) -> io::Result<i
     };
     shell.exit = Some(code);
     Ok(code)
+}
+
+fn alias(
+    shell: &mut Shell,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<i32> {
+    if args.is_empty() {
+        for (name, value) in &shell.aliases {
+            writeln!(out, "alias {name}='{value}'")?;
+        }
+        return Ok(0);
+    }
+
+    let mut status = 0;
+    for arg in args {
+        match arg.split_once('=') {
+            Some((name, value)) if !name.is_empty() => {
+                shell.aliases.insert(name.to_string(), value.to_string());
+            }
+            Some(_) => {
+                writeln!(err, "alias: {arg}: invalid alias name")?;
+                status = 1;
+            }
+            None => match shell.aliases.get(arg) {
+                Some(value) => writeln!(out, "alias {arg}='{value}'")?,
+                None => {
+                    writeln!(err, "alias: {arg}: not found")?;
+                    status = 1;
+                }
+            },
+        }
+    }
+    Ok(status)
 }
 
 fn ls(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> io::Result<i32> {
@@ -133,6 +175,11 @@ fn ls(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> io::Result<i
             .filter(|(name, _)| all || !name.starts_with('.'))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        if all {
+            for name in [".", ".."] {
+                print_entry(out, name, &fs::metadata(format!("{path}/{name}"))?, long)?;
+            }
+        }
         for (name, entry) in entries {
             print_entry(out, &name, &entry.metadata()?, long)?;
         }

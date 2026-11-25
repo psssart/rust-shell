@@ -1,25 +1,27 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Child};
 use std::{env, fs};
 
 use crate::builtins::{self, BUILTINS, error_text};
 use crate::expand::{expand_path, expand_word};
-use crate::parser::{self, Redirect, RedirectKind};
+use crate::parser::{self, Command, Op, Redirect, RedirectKind};
 
 #[derive(Default)]
 pub struct Shell {
+    pub aliases: BTreeMap<String, String>,
     // Exit status of the last command
     pub status: i32,
     // Set by `exit`
     pub exit: Option<i32>,
 }
 
-// Command ready to run, `None` means inherit from the shell
+// Single command of a pipeline, `None` means inherit from the shell
 struct Stage {
     args: Vec<String>,
     stdin: Option<OwnedFd>,
@@ -29,31 +31,78 @@ struct Stage {
 
 impl Shell {
     pub fn run_line(&mut self, line: &str) {
-        let command = match parser::tokenize(line).and_then(parser::parse) {
-            Ok(command) => command,
+        let chain = parser::tokenize(line)
+            .and_then(|tokens| parser::expand_aliases(tokens, &self.aliases))
+            .and_then(parser::parse);
+        let chain = match chain {
+            Ok(chain) => chain,
             Err(e) => {
                 eprintln!("rust-shell: {e}");
                 self.status = 2;
                 return;
             }
         };
-        let mut stage = Stage {
-            args: command.args.iter().flat_map(expand_word).collect(),
-            stdin: None,
-            stdout: None,
-            stderr: None,
-        };
-        if let Err(e) = apply_redirects(&mut stage, &command.redirects) {
-            eprintln!("rust-shell: {e}");
-            self.status = 1;
-            return;
+
+        for (op, pipeline) in chain {
+            let skip = match op {
+                Op::Always => false,
+                Op::And => self.status != 0,
+                Op::Or => self.status == 0,
+            };
+            if skip {
+                continue;
+            }
+            self.status = self.run_pipeline(&pipeline);
+            if self.exit.is_some() {
+                break;
+            }
         }
-        self.status = match stage.args.first() {
-            // Only redirects, like `> file`
-            None => 0,
-            Some(name) if BUILTINS.contains(&name.as_str()) => self.run_builtin(stage),
-            Some(_) => run_external(stage),
+    }
+
+    fn run_pipeline(&mut self, pipeline: &[Command]) -> i32 {
+        let stages = match prepare_stages(pipeline) {
+            Ok(stages) => stages,
+            Err(e) => {
+                eprintln!("rust-shell: {e}");
+                return 1;
+            }
         };
+
+        let mut statuses = vec![0; stages.len()];
+        let mut children = Vec::new();
+        let mut builtin_stages = Vec::new();
+        // Spawn external commands first, so a builtin never blocks on a full pipe
+        for (i, mut stage) in stages.into_iter().enumerate() {
+            match stage.args.first() {
+                None => {}
+                Some(name) if BUILTINS.contains(&name.as_str()) => {
+                    // Builtins don't read stdin
+                    stage.stdin = None;
+                    builtin_stages.push((i, stage));
+                }
+                Some(_) => match spawn(stage) {
+                    Ok(child) => children.push((i, child)),
+                    Err(status) => statuses[i] = status,
+                },
+            }
+        }
+
+        for (i, stage) in builtin_stages {
+            statuses[i] = self.run_builtin(stage);
+        }
+
+        for (i, mut child) in children {
+            statuses[i] = match child.wait() {
+                Ok(status) => status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                Err(e) => {
+                    eprintln!("rust-shell: {e}");
+                    1
+                }
+            };
+        }
+        statuses.last().copied().unwrap_or(0)
     }
 
     fn run_builtin(&mut self, stage: Stage) -> i32 {
@@ -69,11 +118,37 @@ impl Shell {
             out.flush()?;
             Ok(status)
         });
-        result.unwrap_or_else(|e| {
-            eprintln!("rust-shell: {}: {e}", stage.args[0]);
-            1
-        })
+        match result {
+            Ok(status) => status,
+            // Reader went away, e.g. `ls | head -1`
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => 1,
+            Err(e) => {
+                eprintln!("rust-shell: {}: {e}", stage.args[0]);
+                1
+            }
+        }
     }
+}
+
+fn prepare_stages(pipeline: &[Command]) -> Result<Vec<Stage>, String> {
+    let mut stages = Vec::new();
+    let mut prev_reader: Option<OwnedFd> = None;
+    for (i, command) in pipeline.iter().enumerate() {
+        let mut stage = Stage {
+            args: command.args.iter().flat_map(expand_word).collect(),
+            stdin: prev_reader.take(),
+            stdout: None,
+            stderr: None,
+        };
+        if i + 1 < pipeline.len() {
+            let (reader, writer) = io::pipe().map_err(|e| e.to_string())?;
+            stage.stdout = Some(writer.into());
+            prev_reader = Some(reader.into());
+        }
+        apply_redirects(&mut stage, &command.redirects)?;
+        stages.push(stage);
+    }
+    Ok(stages)
 }
 
 fn apply_redirects(stage: &mut Stage, redirects: &[Redirect]) -> Result<(), String> {
@@ -133,11 +208,11 @@ pub fn find_command(name: &str) -> Option<PathBuf> {
         .find(|path| is_executable(path))
 }
 
-fn run_external(stage: Stage) -> i32 {
+fn spawn(stage: Stage) -> Result<Child, i32> {
     let name = &stage.args[0];
     let Some(path) = find_command(name) else {
         eprintln!("rust-shell: {name}: command not found");
-        return 127;
+        return Err(127);
     };
     let mut command = process::Command::new(path);
     command.arg0(name);
@@ -151,21 +226,9 @@ fn run_external(stage: Stage) -> i32 {
     if let Some(fd) = stage.stderr {
         command.stderr(fd);
     }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("rust-shell: {name}: {}", error_text(&e));
-            return if e.kind() == io::ErrorKind::NotFound { 127 } else { 126 };
-        }
-    };
-    match child.wait() {
-        // Killed by a signal, e.g. Ctrl+C gives 130
-        Ok(status) => status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("rust-shell: {e}");
-            1
-        }
-    }
+    command.spawn().map_err(|e| {
+        let code = if e.kind() == io::ErrorKind::NotFound { 127 } else { 126 };
+        eprintln!("rust-shell: {name}: {}", error_text(&e));
+        code
+    })
 }
