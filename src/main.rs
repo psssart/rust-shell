@@ -1,4 +1,6 @@
 mod builtins;
+mod expand;
+mod parser;
 mod shell;
 
 use std::env;
@@ -7,7 +9,21 @@ use std::process;
 
 use shell::Shell;
 
+unsafe extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+const SIGINT: i32 = 2;
+
+extern "C" fn on_sigint(_: i32) {}
+
 fn main() {
+    // Ctrl+C should stop the running command, not the shell.
+    // Unlike ignoring it, a handler is reset back to default in children.
+    unsafe {
+        signal(SIGINT, on_sigint);
+    }
+
     let mut shell = Shell::default();
     let mut line = String::new();
 
